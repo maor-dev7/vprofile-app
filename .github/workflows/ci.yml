@@ -1,0 +1,133 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-sonar:
+    name: Build, test, Checkstyle, and SonarQube
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 21 and cache Maven dependencies
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Cache SonarQube packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: |
+            ${{ runner.os }}-sonar
+
+      - name: Build, run unit tests, and generate Checkstyle report
+        run: mvn clean verify checkstyle:checkstyle -B
+
+      #- name: Build and run unit tests
+      #  run: mvn -B verify
+
+      #- name: Run Checkstyle
+      #  run: mvn -B org.apache.maven.plugins:maven-checkstyle-plugin:3.6.0:checkstyle
+
+      - name: SonarQube scan
+        uses: sonarsource/sonarqube-scan-action@v2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      - name: Check SonarQube quality gate
+        uses: sonarsource/sonarqube-quality-gate-action@v1.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+  docker-build-push:
+    name: Build and push Docker image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.image.outputs.image_tag }}
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'vprofileappimg' }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag output
+        id: image
+        run: echo "image_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image tags
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Docker-files/app/multistage/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.image.outputs.image_tag }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+  update-helm:
+    name: Update Helm values in GitOps repository
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: docker-build-push
+    runs-on: ubuntu-latest
+    env:
+      ECR_REGISTRY: ${{ needs.docker-build-push.outputs.ecr_registry }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'vprofileappimg' }}
+      IMAGE_TAG: ${{ needs.docker-build-push.outputs.image_tag }}
+      HELM_REPO_NAME: ${{ vars.HELM_REPO_NAME || 'vprofile-helm' }}
+      HELM_REPO_USER: ${{ secrets.HELM_REPO_USER }}
+      GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
+    steps:
+      - name: Check out Helm repository
+        run: git clone "https://${HELM_REPO_USER}:${GITOPS_PAT}@github.com/${HELM_REPO_USER}/${HELM_REPO_NAME}.git" helm-repo
+
+      - name: Update image and tag with yq
+        uses: mikefarah/yq@v4
+        with:
+          cmd: yq -i '.app.image = strenv(ECR_REGISTRY) + "/" + strenv(ECR_REPOSITORY) | .app.tag = strenv(IMAGE_TAG)' helm-repo/helm/vprofile/values.yaml
+
+      - name: Commit and push Helm values update
+        working-directory: helm-repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- helm/vprofile/values.yaml; then
+            git add helm/vprofile/values.yaml
+            git commit -m "Deploy vprofile ${IMAGE_TAG}"
+            git push origin HEAD
+          fi
