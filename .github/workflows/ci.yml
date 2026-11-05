@@ -38,7 +38,7 @@ jobs:
             ${{ runner.os }}-sonar
 
       - name: Build, run unit tests, and generate Checkstyle report
-        run: mvn clean verify checkstyle:checkstyle -B
+        run: mvn clean verify checkstyle:checkstyle -B -e
 
       #- name: Build and run unit tests
       #  run: mvn -B verify
