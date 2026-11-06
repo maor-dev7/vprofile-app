@@ -1,5 +1,5 @@
 # VProfile Application
-
+###
 VProfile is a Java Spring MVC web application packaged as a WAR and deployed on Apache Tomcat. It includes user registration, login, and profile pages, with integrations configured for MySQL, Memcached, RabbitMQ, and Elasticsearch.
 
 ## Technology stack
